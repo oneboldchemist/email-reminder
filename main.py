@@ -1,88 +1,173 @@
-# main.py  – Back‑in‑stock‑proxy (FastAPI + Shopify GraphQL)
-# ------------------------------------------
+# main.py – Back-in-stock-proxy (FastAPI + Shopify GraphQL)
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, EmailStr
 import os, httpx
+import logging
 
-# ==== Miljövariabler =======================================================
-SHOP  = os.getenv("SHOPIFY_SHOP", "").strip()          # 8bc028-b3.myshopify.com
-TOKEN = os.getenv("SHOPIFY_ADMIN_TOKEN", "").strip()   # shpat_...
+# ==== Environment Variables =============================================
+SHOP = os.getenv("SHOPIFY_SHOP", "").strip()
+TOKEN = os.getenv("SHOPIFY_ADMIN_TOKEN", "").strip()
 
 if not SHOP or not TOKEN:
-    raise RuntimeError("Miljövariablerna SHOPIFY_SHOP och SHOPIFY_ADMIN_TOKEN måste vara satta.")
+    raise RuntimeError("Environment variables SHOPIFY_SHOP and SHOPIFY_ADMIN_TOKEN must be set.")
 
-# ==== FastAPI‑app ===========================================================
-app = FastAPI(title="Back‑in‑stock customer proxy")
+# ==== FastAPI App ===================================================
+app = FastAPI(title="Back-in-stock customer proxy")
 
-@app.get("/")                            # enkel “ping”
+@app.get("/")
 def health():
     return {"status": "ok"}
 
-# ==== Inkommande payload ====================================================
+# ==== Request Models ================================================
 class Payload(BaseModel):
     email: EmailStr
-    tags:  str
-    note:  str | None = None
+    tags: str
+    note: str | None = None
 
-# ==== Helper for GraphQL calls =============================================
+# ==== GraphQL Helper ================================================
 async def gql(query: str, variables: dict):
-    url = f"https://{SHOP}/admin/api/2025-07/graphql.json"
+    # Fixed: Use 2023-07 API version
+    base_url = f"https://{SHOP}/admin/api/2023-07"
+    url = f"{base_url}/graphql.json"
+    
     headers = {
         "X-Shopify-Access-Token": TOKEN,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Accept": "application/json"
     }
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, json={"query": query, "variables": variables}, headers=headers)
-    resp.raise_for_status()
-    return resp.json()
+    
+    payload = {
+        "query": query,
+        "variables": variables
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            
+        # Check HTTP status
+        if resp.status_code != 200:
+            raise HTTPException(500, f"Shopify API error: {resp.status_code} - {resp.text}")
+            
+        result = resp.json()
+        
+        # Check for GraphQL errors
+        if "errors" in result:
+            error_msg = result["errors"][0].get("message", "Unknown GraphQL error")
+            raise HTTPException(500, f"GraphQL error: {error_msg}")
+            
+        return result
+        
+    except httpx.TimeoutException:
+        raise HTTPException(500, "Request to Shopify API timed out")
+    except httpx.RequestError as e:
+        raise HTTPException(500, f"Request error: {str(e)}")
 
-# ==== Huvud‑endpoint ========================================================
+# ==== Main Endpoint =================================================
 @app.post("/back-in-stock-customer")
 async def back_in_stock(data: Payload):
-    # 1 · Finns kunden?
-    res = await gql(
-        """query($q:String!){
-             customers(first:1, query:$q){edges{node{id}}}}""",
-        {"q": f"email:{data.email}"}
-    )
-    edges = res["data"]["customers"]["edges"]
-
-    if edges:  # ----- uppdatera befintlig kund ------------------------------
-        cid = edges[0]["node"]["id"]
-
-        # a) lägg till taggar
-        await gql(
-            """mutation($id:ID!,$tags:[String!]!){
-                 tagsAdd(id:$id, tags:$tags){userErrors{message}}}""",
-            {"id": cid, "tags": data.tags.split(",")}
-        )
-
-        # b) sätt SUBSCRIBED (om inte redan)
-        upd = await gql(
-            """mutation($id:ID!){
-                 customerUpdate(id:$id, input:{
-                   emailMarketingConsent:{state:SUBSCRIBED}
-                 }){userErrors{message}}}""",
-            {"id": cid}
-        )
-        if errs := upd["data"]["customerUpdate"]["userErrors"]:
-            raise HTTPException(500, errs[0]["message"])
-
-        return {"updated": True}
-
-    # ----- skapa ny kund ----------------------------------------------------
-    crt = await gql(
-        """mutation($input:CustomerInput!){
-             customerCreate(input:$input){
-               customer{id} userErrors{message}}}""",
-        {"input": {
-            "email": data.email,
-            "tags":  data.tags.split(","),
-            "note":  data.note,
-            "emailMarketingConsent": {"state": "SUBSCRIBED"}
-        }}
-    )
-    if errs := crt["data"]["customerCreate"]["userErrors"]:
-        raise HTTPException(500, errs[0]["message"])
-
-    return {"created": True}
+    try:
+        # 1. Check if customer exists
+        customer_query = """
+        query($query: String!) {
+            customers(first: 1, query: $query) {
+                edges {
+                    node {
+                        id
+                        tags
+                    }
+                }
+            }
+        }
+        """
+        
+        res = await gql(customer_query, {"query": f"email:{data.email}"})
+        edges = res["data"]["customers"]["edges"]
+        
+        if edges:  # Update existing customer
+            customer_id = edges[0]["node"]["id"]
+            
+            # Add tags
+            tags_mutation = """
+            mutation($id: ID!, $tags: [String!]!) {
+                tagsAdd(id: $id, tags: $tags) {
+                    userErrors {
+                        field
+                        message
+                    }
+                }
+            }
+            """
+            
+            tag_list = [tag.strip() for tag in data.tags.split(",") if tag.strip()]
+            await gql(tags_mutation, {"id": customer_id, "tags": tag_list})
+            
+            # Update email marketing consent
+            update_mutation = """
+            mutation($id: ID!) {
+                customerUpdate(id: $id, input: {
+                    emailMarketingConsent: {
+                        marketingState: SUBSCRIBED
+                    }
+                }) {
+                    customer {
+                        id
+                    }
+                    userErrors {
+                        field
+                        message
+                    }
+                }
+            }
+            """
+            
+            update_result = await gql(update_mutation, {"id": customer_id})
+            
+            if update_result["data"]["customerUpdate"]["userErrors"]:
+                error_msg = update_result["data"]["customerUpdate"]["userErrors"][0]["message"]
+                raise HTTPException(500, f"Failed to update customer: {error_msg}")
+                
+            return {"updated": True, "customer_id": customer_id}
+            
+        else:  # Create new customer
+            create_mutation = """
+            mutation($input: CustomerInput!) {
+                customerCreate(input: $input) {
+                    customer {
+                        id
+                        email
+                    }
+                    userErrors {
+                        field
+                        message
+                    }
+                }
+            }
+            """
+            
+            tag_list = [tag.strip() for tag in data.tags.split(",") if tag.strip()]
+            
+            customer_input = {
+                "email": data.email,
+                "tags": tag_list,
+                "emailMarketingConsent": {
+                    "marketingState": "SUBSCRIBED"
+                }
+            }
+            
+            if data.note:
+                customer_input["note"] = data.note
+                
+            create_result = await gql(create_mutation, {"input": customer_input})
+            
+            if create_result["data"]["customerCreate"]["userErrors"]:
+                error_msg = create_result["data"]["customerCreate"]["userErrors"][0]["message"]
+                raise HTTPException(500, f"Failed to create customer: {error_msg}")
+                
+            customer_id = create_result["data"]["customerCreate"]["customer"]["id"]
+            return {"created": True, "customer_id": customer_id}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Unexpected error: {str(e)}")
