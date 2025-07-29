@@ -1,5 +1,6 @@
 # main.py – Back‑in‑stock‑proxy (FastAPI + Shopify GraphQL)
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 import os, httpx, logging
 
@@ -16,6 +17,15 @@ if not SHOP or not TOKEN:
 # ==== FastAPI app =========================================================
 app = FastAPI(title="Back‑in‑stock customer proxy")
 
+# Allow the browser in your storefront to call this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # byt gärna mot din butiksdomän för striktare policy
+    allow_credentials=True,
+    allow_methods=["POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
 @app.get("/")
 def health():
     return {"status": "ok"}
@@ -28,7 +38,6 @@ class Payload(BaseModel):
 
 # ==== GraphQL helper ======================================================
 async def gql(query: str, variables: dict[str, object]):
-    """Send a GraphQL request to the Admin API and return the JSON body."""
     url = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
     headers = {
         "X-Shopify-Access-Token": TOKEN,
@@ -57,37 +66,39 @@ def clean_tags(raw: str) -> list[str]:
     return [t.strip() for t in raw.split(",") if t.strip()]
 
 EMAIL_CONSENT_SUBSCRIBED = {
-    "marketingState": "SUBSCRIBED",
-    "marketingOptInLevel": "SINGLE_OPT_IN",   # ⬅ single‑opt‑in ⇒ no confirmation email
+    "marketingState": "SUBSCRIBED",           # kunden hamnar direkt som prenumerant
+    "marketingOptInLevel": "SINGLE_OPT_IN",   # ingen dubbel opt‑in‑mejl skickas
 }
 
 # ==== Main endpoint ========================================================
 @app.post("/back-in-stock-customer")
 async def back_in_stock(p: Payload):
     """
-    Ensure a Shopify customer exists, is tagged, and is *instantly*
-    subscribed to email marketing (single opt‑in = no confirmation email).
+    Säkerställ att en kund finns, taggas och hamnar direkt som SUBSCRIBED
+    utan bekräftelsemejl (single opt‑in).
     """
     try:
-        # 1. Look up by e‑mail
-        q = """
-        query($query: String!) {
-          customers(first: 1, query: $query) {
-            edges { node { id tags } }
-          }
-        }
-        """
-        res = await gql(q, {"query": f"email:{p.email}"})
+        # 1. Leta upp kunden på e‑post
+        res = await gql(
+            """
+            query($query: String!) {
+              customers(first: 1, query: $query) {
+                edges { node { id tags } }
+              }
+            }
+            """,
+            {"query": f"email:{p.email}"},
+        )
         edges = res["data"]["customers"]["edges"]
         tags = clean_tags(p.tags)
 
         # ------------------------------------------------------------------
-        # Existing customer → update
+        # Befintlig kund → uppdatera
         # ------------------------------------------------------------------
         if edges:
             cid = edges[0]["node"]["id"]
 
-            # a. merge tags
+            # a. Lägg till taggar
             if tags:
                 await gql(
                     """
@@ -98,7 +109,7 @@ async def back_in_stock(p: Payload):
                     {"id": cid, "tags": tags},
                 )
 
-            # b. force subscription (single opt‑in)
+            # b. Tvinga prenumeration
             cres = await gql(
                 """
                 mutation($input: CustomerEmailMarketingConsentUpdateInput!) {
@@ -121,7 +132,7 @@ async def back_in_stock(p: Payload):
             return {"updated": True, "customer_id": cid}
 
         # ------------------------------------------------------------------
-        # New customer → create
+        # Ny kund → skapa
         # ------------------------------------------------------------------
         cust_input: dict[str, object] = {
             "email": p.email,
