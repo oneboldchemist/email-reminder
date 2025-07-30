@@ -1,7 +1,7 @@
 # main.py – Back‑in‑stock‑proxy (FastAPI + Shopify GraphQL)
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, root_validator
+from pydantic import BaseModel, EmailStr, field_validator
 import os, httpx, logging, re, asyncio
 
 # ==== Environment =========================================================
@@ -19,7 +19,7 @@ app = FastAPI(title="Back‑in‑stock customer proxy")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # byt gärna till din butiksdomän
+    allow_origins=["*"],          # byt gärna mot din butiksdomän
     allow_credentials=True,
     allow_methods=["POST", "OPTIONS"],
     allow_headers=["*"],
@@ -32,12 +32,14 @@ def health():
 # ==== Request model =======================================================
 class Payload(BaseModel):
     email: EmailStr
-    tags: str                 # komma‑separerade taggar – oförändrat!
+    tags: str                 # komma‑separerade taggar – frontenden oförändrad
     note: str | None = None
 
-    @root_validator
-    def _tags_must_exist(cls, v):
-        if not v.get("tags"):
+    # Pydantic v2‑sätt att validera fältet
+    @field_validator("tags")
+    @classmethod
+    def tags_must_not_be_empty(cls, v: str) -> str:
+        if not v.strip():
             raise ValueError("tags får inte vara tomt")
         return v
 
@@ -70,11 +72,11 @@ EMAIL_CONSENT_SUBSCRIBED = {
     "marketingOptInLevel": "SINGLE_OPT_IN",
 }
 
-GID_RX   = re.compile(r"^gid://shopify/ProductVariant/(\d+)$")
-NUM_RX   = re.compile(r"^\d+$")
+GID_RX = re.compile(r"^gid://shopify/ProductVariant/(\d+)$")
+NUM_RX = re.compile(r"^\d+$")
 
 async def build_backin_tag(variant_gid: str) -> str:
-    """Returnerar backin‑tagg 'backin|handle|id' för given variant‑GID."""
+    """Returnerar backin‑tagg `backin|handle|id` för given variant‑GID."""
     res = await gql(
         """
         query($id: ID!) {
@@ -92,45 +94,42 @@ async def build_backin_tag(variant_gid: str) -> str:
     if not node:
         raise HTTPException(400, f"Ogiltig variant‑GID: {variant_gid}")
 
-    handle     = node["product"]["handle"]
+    handle = node["product"]["handle"]
     variant_id = variant_gid.split("/")[-1]
     return f"backin|{handle}|{variant_id}"
 
 async def normalize_tags(raw: str) -> list[str]:
     """
-    Tar en komma‑separerad taggsträng från frontend och
-    returnerar en lista där varje variant‑GID eller siffra
-    ersätts av backin‑taggen.
+    Tar en komma‑separerad taggsträng och returnerar en lista där varje
+    variant‑GID eller siffra ersätts av backin‑taggen.
     """
     result: list[str] = []
     tasks: list[asyncio.Task] = []
 
     for t in [x.strip() for x in raw.split(",") if x.strip()]:
-        gid_match = GID_RX.match(t)
-        num_match = NUM_RX.match(t)
-
-        if gid_match:
+        if GID_RX.fullmatch(t):
             tasks.append(asyncio.create_task(build_backin_tag(t)))
-        elif num_match:
+        elif NUM_RX.fullmatch(t):
             gid = f"gid://shopify/ProductVariant/{t}"
             tasks.append(asyncio.create_task(build_backin_tag(gid)))
         else:
-            result.append(t)  # vanlig tagg, behåll som den är
+            result.append(t)  # vanlig tagg
 
-    # vänta in alla async variant‑uppslag
     for task in tasks:
         result.append(await task)
 
-    # ta bort ev dubblerade taggar
+    # ta bort dubletter men behåll ordning
     return list(dict.fromkeys(result))
 
 # ==== Main endpoint ========================================================
 @app.post("/back-in-stock-customer")
 async def back_in_stock(p: Payload):
     """
-    Skapar eller uppdaterar en kund, lägger till back‑in‑taggar
-    och sätter e‑postsamtycke till SUBSCRIBED (single opt‑in).
-    Frontend‑payloaden kan förbli oförändrad.
+    Frontend skickar samma sak som alltid:
+    { "email": "...", "tags": "...", "note": "..." }
+
+    • Variant‑ID eller GID i `tags` översätts till backin‑tagg
+    • Kunden skapas/uppdateras, sätts som SUBSCRIBED
     """
     try:
         tags = await normalize_tags(p.tags)
