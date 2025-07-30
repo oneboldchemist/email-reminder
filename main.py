@@ -1,8 +1,8 @@
 # main.py – Back‑in‑stock‑proxy (FastAPI + Shopify GraphQL)
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
-import os, httpx, logging
+from pydantic import BaseModel, EmailStr, root_validator
+import os, httpx, logging, re, asyncio
 
 # ==== Environment =========================================================
 SHOP  = os.getenv("SHOPIFY_SHOP", "").strip()
@@ -17,10 +17,9 @@ if not SHOP or not TOKEN:
 # ==== FastAPI app =========================================================
 app = FastAPI(title="Back‑in‑stock customer proxy")
 
-# Allow the browser in your storefront to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # byt gärna mot din butiksdomän för striktare policy
+    allow_origins=["*"],          # byt gärna till din butiksdomän
     allow_credentials=True,
     allow_methods=["POST", "OPTIONS"],
     allow_headers=["*"],
@@ -33,8 +32,14 @@ def health():
 # ==== Request model =======================================================
 class Payload(BaseModel):
     email: EmailStr
-    variant_gid: str              # t.ex. "gid://shopify/ProductVariant/123456789"
-    note: str | None = None       # valfritt kund‑anteckningsfält
+    tags: str                 # komma‑separerade taggar – oförändrat!
+    note: str | None = None
+
+    @root_validator
+    def _tags_must_exist(cls, v):
+        if not v.get("tags"):
+            raise ValueError("tags får inte vara tomt")
+        return v
 
 # ==== GraphQL helper ======================================================
 async def gql(query: str, variables: dict[str, object]):
@@ -50,12 +55,10 @@ async def gql(query: str, variables: dict[str, object]):
             r = await client.post(url, json={"query": query, "variables": variables}, headers=headers)
         if r.status_code != 200:
             raise HTTPException(500, f"Shopify API error {r.status_code}: {r.text}")
-
         data = r.json()
         if "errors" in data:
             raise HTTPException(500, f"GraphQL error: {data['errors'][0].get('message','?')}")
         return data
-
     except httpx.TimeoutException:
         raise HTTPException(500, "Request to Shopify API timed out")
     except httpx.RequestError as exc:
@@ -63,16 +66,15 @@ async def gql(query: str, variables: dict[str, object]):
 
 # ==== Helpers =============================================================
 EMAIL_CONSENT_SUBSCRIBED = {
-    "marketingState": "SUBSCRIBED",           # kunden hamnar direkt som prenumerant
-    "marketingOptInLevel": "SINGLE_OPT_IN",   # ingen dubbel opt‑in‑mejl skickas
+    "marketingState": "SUBSCRIBED",
+    "marketingOptInLevel": "SINGLE_OPT_IN",
 }
 
+GID_RX   = re.compile(r"^gid://shopify/ProductVariant/(\d+)$")
+NUM_RX   = re.compile(r"^\d+$")
+
 async def build_backin_tag(variant_gid: str) -> str:
-    """
-    Hämtar produkt‑handle från en variant‑GID och bygger taggen:
-    backin|<handle>|<variant‑id>
-    """
-    # 1. Slå upp variant → få product.handle
+    """Returnerar backin‑tagg 'backin|handle|id' för given variant‑GID."""
     res = await gql(
         """
         query($id: ID!) {
@@ -88,30 +90,57 @@ async def build_backin_tag(variant_gid: str) -> str:
     )
     node = res["data"]["node"]
     if not node:
-        raise HTTPException(400, "Ogiltig variant‑GID")
+        raise HTTPException(400, f"Ogiltig variant‑GID: {variant_gid}")
 
-    handle = node["product"]["handle"]
-    variant_id = variant_gid.split("/")[-1]  # numeriska ID:t
-
+    handle     = node["product"]["handle"]
+    variant_id = variant_gid.split("/")[-1]
     return f"backin|{handle}|{variant_id}"
+
+async def normalize_tags(raw: str) -> list[str]:
+    """
+    Tar en komma‑separerad taggsträng från frontend och
+    returnerar en lista där varje variant‑GID eller siffra
+    ersätts av backin‑taggen.
+    """
+    result: list[str] = []
+    tasks: list[asyncio.Task] = []
+
+    for t in [x.strip() for x in raw.split(",") if x.strip()]:
+        gid_match = GID_RX.match(t)
+        num_match = NUM_RX.match(t)
+
+        if gid_match:
+            tasks.append(asyncio.create_task(build_backin_tag(t)))
+        elif num_match:
+            gid = f"gid://shopify/ProductVariant/{t}"
+            tasks.append(asyncio.create_task(build_backin_tag(gid)))
+        else:
+            result.append(t)  # vanlig tagg, behåll som den är
+
+    # vänta in alla async variant‑uppslag
+    for task in tasks:
+        result.append(await task)
+
+    # ta bort ev dubblerade taggar
+    return list(dict.fromkeys(result))
 
 # ==== Main endpoint ========================================================
 @app.post("/back-in-stock-customer")
 async def back_in_stock(p: Payload):
     """
-    Skapar eller uppdaterar en kund, lägger till backin‑taggen
+    Skapar eller uppdaterar en kund, lägger till back‑in‑taggar
     och sätter e‑postsamtycke till SUBSCRIBED (single opt‑in).
+    Frontend‑payloaden kan förbli oförändrad.
     """
     try:
-        # 0. Bygg taggen för den aktuella varianten
-        tag = await build_backin_tag(p.variant_gid)
+        tags = await normalize_tags(p.tags)
 
-        # 1. Leta upp kunden på e‑post
+        # 1. Finns kunden redan?
         res = await gql(
             """
             query($query: String!) {
               customers(first: 1, query: $query) {
-                edges { node { id tags } }
+                edges { node { id } }
               }
             }
             """,
@@ -125,17 +154,18 @@ async def back_in_stock(p: Payload):
         if edges:
             cid = edges[0]["node"]["id"]
 
-            # a. Lägg till taggen
-            await gql(
-                """
-                mutation($id: ID!, $tags: [String!]!) {
-                  tagsAdd(id: $id, tags: $tags) { userErrors { field message } }
-                }
-                """,
-                {"id": cid, "tags": [tag]},
-            )
+            # a. Lägg till taggarna
+            if tags:
+                await gql(
+                    """
+                    mutation($id: ID!, $tags: [String!]!) {
+                      tagsAdd(id: $id, tags: $tags) { userErrors { field message } }
+                    }
+                    """,
+                    {"id": cid, "tags": tags},
+                )
 
-            # b. Tvinga prenumeration
+            # b. Sätt SUBSCRIBED
             cres = await gql(
                 """
                 mutation($input: CustomerEmailMarketingConsentUpdateInput!) {
@@ -162,7 +192,7 @@ async def back_in_stock(p: Payload):
         # ------------------------------------------------------------------
         cust_input: dict[str, object] = {
             "email": p.email,
-            "tags": [tag],
+            "tags": tags,
             "emailMarketingConsent": EMAIL_CONSENT_SUBSCRIBED,
         }
         if p.note:
