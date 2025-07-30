@@ -33,8 +33,8 @@ def health():
 # ==== Request model =======================================================
 class Payload(BaseModel):
     email: EmailStr
-    tags: str
-    note: str | None = None
+    variant_gid: str              # t.ex. "gid://shopify/ProductVariant/123456789"
+    note: str | None = None       # valfritt kund‑anteckningsfält
 
 # ==== GraphQL helper ======================================================
 async def gql(query: str, variables: dict[str, object]):
@@ -61,23 +61,51 @@ async def gql(query: str, variables: dict[str, object]):
     except httpx.RequestError as exc:
         raise HTTPException(500, f"Request error: {str(exc)}")
 
-# ==== Helpers ==============================================================
-def clean_tags(raw: str) -> list[str]:
-    return [t.strip() for t in raw.split(",") if t.strip()]
-
+# ==== Helpers =============================================================
 EMAIL_CONSENT_SUBSCRIBED = {
     "marketingState": "SUBSCRIBED",           # kunden hamnar direkt som prenumerant
     "marketingOptInLevel": "SINGLE_OPT_IN",   # ingen dubbel opt‑in‑mejl skickas
 }
 
+async def build_backin_tag(variant_gid: str) -> str:
+    """
+    Hämtar produkt‑handle från en variant‑GID och bygger taggen:
+    backin|<handle>|<variant‑id>
+    """
+    # 1. Slå upp variant → få product.handle
+    res = await gql(
+        """
+        query($id: ID!) {
+          node(id: $id) {
+            ... on ProductVariant {
+              id
+              product { handle }
+            }
+          }
+        }
+        """,
+        {"id": variant_gid},
+    )
+    node = res["data"]["node"]
+    if not node:
+        raise HTTPException(400, "Ogiltig variant‑GID")
+
+    handle = node["product"]["handle"]
+    variant_id = variant_gid.split("/")[-1]  # numeriska ID:t
+
+    return f"backin|{handle}|{variant_id}"
+
 # ==== Main endpoint ========================================================
 @app.post("/back-in-stock-customer")
 async def back_in_stock(p: Payload):
     """
-    Säkerställ att en kund finns, taggas och hamnar direkt som SUBSCRIBED
-    utan bekräftelsemejl (single opt‑in).
+    Skapar eller uppdaterar en kund, lägger till backin‑taggen
+    och sätter e‑postsamtycke till SUBSCRIBED (single opt‑in).
     """
     try:
+        # 0. Bygg taggen för den aktuella varianten
+        tag = await build_backin_tag(p.variant_gid)
+
         # 1. Leta upp kunden på e‑post
         res = await gql(
             """
@@ -90,7 +118,6 @@ async def back_in_stock(p: Payload):
             {"query": f"email:{p.email}"},
         )
         edges = res["data"]["customers"]["edges"]
-        tags = clean_tags(p.tags)
 
         # ------------------------------------------------------------------
         # Befintlig kund → uppdatera
@@ -98,16 +125,15 @@ async def back_in_stock(p: Payload):
         if edges:
             cid = edges[0]["node"]["id"]
 
-            # a. Lägg till taggar
-            if tags:
-                await gql(
-                    """
-                    mutation($id: ID!, $tags: [String!]!) {
-                      tagsAdd(id: $id, tags: $tags) { userErrors { field message } }
-                    }
-                    """,
-                    {"id": cid, "tags": tags},
-                )
+            # a. Lägg till taggen
+            await gql(
+                """
+                mutation($id: ID!, $tags: [String!]!) {
+                  tagsAdd(id: $id, tags: $tags) { userErrors { field message } }
+                }
+                """,
+                {"id": cid, "tags": [tag]},
+            )
 
             # b. Tvinga prenumeration
             cres = await gql(
@@ -136,7 +162,7 @@ async def back_in_stock(p: Payload):
         # ------------------------------------------------------------------
         cust_input: dict[str, object] = {
             "email": p.email,
-            "tags": tags,
+            "tags": [tag],
             "emailMarketingConsent": EMAIL_CONSENT_SUBSCRIBED,
         }
         if p.note:
